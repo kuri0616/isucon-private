@@ -211,36 +211,35 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 }
 
 func makePosts(ctx context.Context, results []Post, csrfToken string, allComments bool) ([]Post, error) {
-	// 1st pass: コメントを取得しつつ、必要な user_id を集める
+	// 投稿ごとに COUNT + コメント取得を投げていた N+1 を 1 クエリにまとめる
+	postIDs := make([]int, len(results))
+	for i, p := range results {
+		postIDs[i] = p.ID
+	}
+
+	commentsByPost, err := getCommentsByPostIDs(ctx, postIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	limit := 3
+	if allComments {
+		limit = 0
+	}
+
+	// 1st pass: コメントを割り当てつつ、必要な user_id を集める
 	userIDs := make(map[int]struct{}, len(results))
 
 	for i := range results {
 		p := &results[i]
+		all := commentsByPost[p.ID]
 
-		err := db.GetContext(ctx, &p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
-		if err != nil {
-			return nil, err
-		}
-
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
-		if !allComments {
-			query += " LIMIT 3"
-		}
-		var comments []Comment
-		err = db.SelectContext(ctx, &comments, query, p.ID)
-		if err != nil {
-			return nil, err
-		}
-
-		// reverse
-		for l, r := 0, len(comments)-1; l < r; l, r = l+1, r-1 {
-			comments[l], comments[r] = comments[r], comments[l]
-		}
-
-		p.Comments = comments
+		// 全件取得しているので COUNT クエリは不要
+		p.CommentCount = len(all)
+		p.Comments = pickComments(all, limit)
 
 		userIDs[p.UserID] = struct{}{}
-		for _, c := range comments {
+		for _, c := range p.Comments {
 			userIDs[c.UserID] = struct{}{}
 		}
 	}
@@ -300,6 +299,49 @@ func getUsersByIDs(ctx context.Context, idSet map[int]struct{}) (map[int]User, e
 	}
 
 	return users, nil
+}
+
+// 複数投稿のコメントをまとめて 1 クエリで取得する (N+1 解消)。
+// 各投稿のコメントは created_at の降順で並ぶ
+func getCommentsByPostIDs(ctx context.Context, postIDs []int) (map[int][]Comment, error) {
+	byPost := make(map[int][]Comment, len(postIDs))
+	if len(postIDs) == 0 {
+		return byPost, nil
+	}
+
+	query, args, err := sqlx.In(
+		"SELECT * FROM `comments` WHERE `post_id` IN (?) ORDER BY `post_id`, `created_at` DESC",
+		postIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	rows := []Comment{}
+	if err := db.SelectContext(ctx, &rows, query, args...); err != nil {
+		return nil, err
+	}
+
+	for _, c := range rows {
+		byPost[c.PostID] = append(byPost[c.PostID], c)
+	}
+
+	return byPost, nil
+}
+
+// 取得済みコメント (created_at の降順) から表示用の並び (昇順) を作る。
+// limit <= 0 なら全件。元のスライスは壊さない
+func pickComments(all []Comment, limit int) []Comment {
+	n := len(all)
+	if limit > 0 && n > limit {
+		n = limit
+	}
+
+	display := make([]Comment, n)
+	for i := 0; i < n; i++ {
+		display[i] = all[n-1-i]
+	}
+
+	return display
 }
 
 func imageURL(p Post) string {
@@ -619,33 +661,22 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	postIDs := []int{}
-	err = db.SelectContext(ctx, &postIDs, "SELECT `id` FROM `posts` WHERE `user_id` = ?", user.ID)
+	// 以前は id を全件引いてから手組みの IN (...) に渡していたが、
+	// 件数しか使わないので集約クエリ 2 本にする
+	postCount := 0
+	err = db.GetContext(ctx, &postCount, "SELECT COUNT(*) AS count FROM `posts` WHERE `user_id` = ?", user.ID)
 	if err != nil {
 		log.Print(err)
 		return
 	}
-	postCount := len(postIDs)
 
 	commentedCount := 0
-	if postCount > 0 {
-		s := []string{}
-		for range postIDs {
-			s = append(s, "?")
-		}
-		placeholder := strings.Join(s, ", ")
-
-		// convert []int -> []any
-		args := make([]any, len(postIDs))
-		for i, v := range postIDs {
-			args[i] = v
-		}
-
-		err = db.GetContext(ctx, &commentedCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN ("+placeholder+")", args...)
-		if err != nil {
-			log.Print(err)
-			return
-		}
+	err = db.GetContext(ctx, &commentedCount,
+		"SELECT COUNT(*) AS count FROM `comments` AS c JOIN `posts` AS p ON p.id = c.post_id WHERE p.user_id = ?",
+		user.ID)
+	if err != nil {
+		log.Print(err)
+		return
 	}
 
 	me := getSessionUser(r)
