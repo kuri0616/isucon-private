@@ -218,9 +218,6 @@ func makePosts(ctx context.Context, results []Post, csrfToken string, allComment
 		if p.User.DelFlg == 0 {
 			posts = append(posts, p)
 		}
-		if len(posts) >= postsPerPage {
-			break
-		}
 	}
 
 	return posts, nil
