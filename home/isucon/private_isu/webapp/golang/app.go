@@ -176,9 +176,12 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 }
 
 func makePosts(ctx context.Context, results []Post, csrfToken string, allComments bool) ([]Post, error) {
-	var posts []Post
+	// 1st pass: コメントを取得しつつ、必要な user_id を集める
+	userIDs := make(map[int]struct{}, len(results))
 
-	for _, p := range results {
+	for i := range results {
+		p := &results[i]
+
 		err := db.GetContext(ctx, &p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
 		if err != nil {
 			return nil, err
@@ -194,33 +197,74 @@ func makePosts(ctx context.Context, results []Post, csrfToken string, allComment
 			return nil, err
 		}
 
-		for i := range comments {
-			err := db.GetContext(ctx, &comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
-			if err != nil {
-				return nil, err
-			}
-		}
-
 		// reverse
-		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
-			comments[i], comments[j] = comments[j], comments[i]
+		for l, r := 0, len(comments)-1; l < r; l, r = l+1, r-1 {
+			comments[l], comments[r] = comments[r], comments[l]
 		}
 
 		p.Comments = comments
 
-		err = db.GetContext(ctx, &p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-		if err != nil {
-			return nil, err
+		userIDs[p.UserID] = struct{}{}
+		for _, c := range comments {
+			userIDs[c.UserID] = struct{}{}
+		}
+	}
+
+	// 投稿者とコメント者をまとめて 1 クエリで取得する (N+1 解消)
+	users, err := getUsersByIDs(ctx, userIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	// 2nd pass: 取得済みの users を割り当てる
+	var posts []Post
+
+	for i := range results {
+		p := results[i]
+
+		p.User = users[p.UserID]
+		if p.User.DelFlg != 0 {
+			continue
+		}
+
+		for j := range p.Comments {
+			p.Comments[j].User = users[p.Comments[j].UserID]
 		}
 
 		p.CSRFToken = csrfToken
 
-		if p.User.DelFlg == 0 {
-			posts = append(posts, p)
-		}
+		posts = append(posts, p)
 	}
 
 	return posts, nil
+}
+
+func getUsersByIDs(ctx context.Context, idSet map[int]struct{}) (map[int]User, error) {
+	users := make(map[int]User, len(idSet))
+	if len(idSet) == 0 {
+		return users, nil
+	}
+
+	ids := make([]int, 0, len(idSet))
+	for id := range idSet {
+		ids = append(ids, id)
+	}
+
+	query, args, err := sqlx.In("SELECT * FROM `users` WHERE `id` IN (?)", ids)
+	if err != nil {
+		return nil, err
+	}
+
+	rows := []User{}
+	if err := db.SelectContext(ctx, &rows, query, args...); err != nil {
+		return nil, err
+	}
+
+	for _, u := range rows {
+		users[u.ID] = u
+	}
+
+	return users, nil
 }
 
 func imageURL(p Post) string {
