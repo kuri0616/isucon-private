@@ -1,1 +1,3 @@
 app
+# ビルド成果物のみ。cmd/exportimages/ のソースを巻き込まないよう先頭を固定する
+/exportimages

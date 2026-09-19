@@ -167,6 +167,8 @@
 /home/isucon/go/
 /home/isucon/private_isu/benchmarker/
 /home/isucon/private_isu/webapp/sql/admin/
+# imgdata から生成される実体。DB が正なのでコミットしない
+/home/isucon/private_isu/webapp/public/image/
 /home/isucon/private_isu/webapp/tenant_db/
 /home/isucon/private_isu/webapp/go/isuports
 /home/isucon/private_isu/webapp/node/

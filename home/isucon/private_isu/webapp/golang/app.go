@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -26,8 +27,11 @@ import (
 )
 
 var (
-	db    *sqlx.DB
-	store *gsm.MemcacheStore
+	db         *sqlx.DB
+	store      *gsm.MemcacheStore
+	publicDir  string
+	imageDir   string
+	imageDirOK bool
 )
 
 const (
@@ -79,6 +83,35 @@ func init() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 }
 
+// 静的配信ディレクトリを解決する。FileServer もこの publicDir を使うので、
+// 「書き出す先」と「配信する先」が食い違うことはない
+func initImageDir() {
+	publicDir = os.Getenv("ISUCONP_PUBLIC_DIR")
+	if publicDir == "" {
+		publicDir = "../public"
+	}
+	imageDir = filepath.Join(publicDir, "image")
+
+	// 書けない環境 (docker の bind mount など) でも起動は止めない。
+	// imageDirOK=false なら従来どおり DB から配信するだけ
+	if err := os.MkdirAll(imageDir, 0o755); err != nil {
+		log.Printf("image dir unavailable (%s): %s; serving images from DB only", imageDir, err)
+		return
+	}
+	// MkdirAll は umask の影響を受けるので nginx (www-data) 向けに念のため直す
+	os.Chmod(imageDir, 0o755)
+
+	probe, err := os.CreateTemp(imageDir, ".probe-")
+	if err != nil {
+		log.Printf("image dir not writable (%s): %s; serving images from DB only", imageDir, err)
+		return
+	}
+	probe.Close()
+	os.Remove(probe.Name())
+
+	imageDirOK = true
+}
+
 func dbInitialize(ctx context.Context) {
 	sqls := []string{
 		"DELETE FROM users WHERE id > 1000",
@@ -91,6 +124,8 @@ func dbInitialize(ctx context.Context) {
 	for _, sql := range sqls {
 		db.ExecContext(ctx, sql)
 	}
+
+	pruneImageFiles(10000)
 }
 
 func tryLogin(ctx context.Context, accountName, password string) *User {
@@ -268,16 +303,99 @@ func getUsersByIDs(ctx context.Context, idSet map[int]struct{}) (map[int]User, e
 }
 
 func imageURL(p Post) string {
-	ext := ""
-	if p.Mime == "image/jpeg" {
-		ext = ".jpg"
-	} else if p.Mime == "image/png" {
-		ext = ".png"
-	} else if p.Mime == "image/gif" {
-		ext = ".gif"
+	return "/image/" + strconv.Itoa(p.ID) + imageExt(p.Mime)
+}
+
+func imageExt(mime string) string {
+	switch mime {
+	case "image/jpeg":
+		return ".jpg"
+	case "image/png":
+		return ".png"
+	case "image/gif":
+		return ".gif"
+	}
+	return ""
+}
+
+func mimeForExt(ext string) string {
+	switch ext {
+	case "jpg":
+		return "image/jpeg"
+	case "png":
+		return "image/png"
+	case "gif":
+		return "image/gif"
+	}
+	return ""
+}
+
+func imagePath(id int, mime string) string {
+	ext := imageExt(mime)
+	if ext == "" {
+		return ""
+	}
+	return filepath.Join(imageDir, strconv.Itoa(id)+ext)
+}
+
+// 画像は nginx が /image/ を静的配信するのでファイルとして置く。
+// 同一ディレクトリの一時ファイル + rename でアトミックに差し替える
+// (直接書くと nginx が書きかけのファイルを配信してしまう)
+func saveImageFile(id int, mime string, data []byte) error {
+	if !imageDirOK {
+		return nil
 	}
 
-	return "/image/" + strconv.Itoa(p.ID) + ext
+	p := imagePath(id, mime)
+	if p == "" {
+		return fmt.Errorf("unsupported mime: %s", mime)
+	}
+
+	tmp, err := os.CreateTemp(imageDir, ".tmp-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name()) // rename が成功していれば no-op
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	// CreateTemp は 0600 で作るので nginx (www-data) から読めない
+	if err := os.Chmod(tmp.Name(), 0o644); err != nil {
+		return err
+	}
+
+	return os.Rename(tmp.Name(), p)
+}
+
+// DELETE FROM posts WHERE id > 10000 に合わせてファイル側も揃える。
+// 残しておくと AUTO_INCREMENT が巻き戻ったときに前回の画像を配信してしまう
+func pruneImageFiles(maxID int) {
+	if !imageDirOK {
+		return
+	}
+
+	entries, err := os.ReadDir(imageDir)
+	if err != nil {
+		log.Print(err)
+		return
+	}
+
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, ".tmp-") || strings.HasPrefix(name, ".probe-") {
+			os.Remove(filepath.Join(imageDir, name))
+			continue
+		}
+		base := strings.TrimSuffix(name, filepath.Ext(name))
+		if id, err := strconv.Atoi(base); err == nil && id > maxID {
+			os.Remove(filepath.Join(imageDir, name))
+		}
+	}
 }
 
 func isLogin(u User) bool {
@@ -608,7 +726,8 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.SelectContext(ctx, &results, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+	// imgdata は使わないので読まない (mediumblob の転送を避ける)
+	err = db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `id` = ?", pid)
 	if err != nil {
 		log.Print(err)
 		return
@@ -721,6 +840,12 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := saveImageFile(int(pid), mime, filedata); err != nil {
+		// 画像は DB にも入っているので、失敗しても getImage の lazy 生成で回復できる。
+		// 投稿自体は成功させる
+		log.Print(err)
+	}
+
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
 }
 
@@ -733,28 +858,52 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ext := r.PathValue("ext")
+	wantMime := mimeForExt(ext)
+	if wantMime == "" {
+		// 対応外の拡張子はどの投稿とも一致しえないので DB を見るまでもない
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	// 通常は nginx が try_files で静的配信するのでここには来ない。
+	// nginx を経由しない直アクセス用に、ファイルがあれば DB を叩かず返す
+	if imageDirOK {
+		if f, err := os.Open(imagePath(pid, wantMime)); err == nil {
+			defer f.Close()
+			// 中身が空なら壊れているので DB から読み直す (lazy 生成でファイルが治る)
+			if st, err := f.Stat(); err == nil && st.Mode().IsRegular() && st.Size() > 0 {
+				w.Header().Set("Content-Type", wantMime)
+				w.Header().Set("Cache-Control", "public, max-age=86400")
+				http.ServeContent(w, r, "", st.ModTime(), f)
+				return
+			}
+		}
+	}
+
+	// ファイルが無い分だけ DB から読み出し、ついでに書き出しておく (lazy 生成)
 	post := Post{}
-	err = db.GetContext(ctx, &post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+	err = db.GetContext(ctx, &post, "SELECT `mime`, `imgdata` FROM `posts` WHERE `id` = ?", pid)
 	if err != nil {
 		log.Print(err)
+		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
-	ext := r.PathValue("ext")
-
-	if ext == "jpg" && post.Mime == "image/jpeg" ||
-		ext == "png" && post.Mime == "image/png" ||
-		ext == "gif" && post.Mime == "image/gif" {
-		w.Header().Set("Content-Type", post.Mime)
-		_, err := w.Write(post.Imgdata)
-		if err != nil {
-			log.Print(err)
-			return
-		}
+	if post.Mime != wantMime {
+		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
-	w.WriteHeader(http.StatusNotFound)
+	if err := saveImageFile(pid, post.Mime, post.Imgdata); err != nil {
+		log.Print(err) // 書き出しに失敗しても配信は続ける
+	}
+
+	w.Header().Set("Content-Type", post.Mime)
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	if _, err := w.Write(post.Imgdata); err != nil {
+		log.Print(err)
+	}
 }
 
 func postComment(w http.ResponseWriter, r *http.Request) {
@@ -894,6 +1043,8 @@ func main() {
 	}
 	defer db.Close()
 
+	initImageDir()
+
 	r := chi.NewRouter()
 
 	r.Get("/initialize", getInitialize)
@@ -907,11 +1058,16 @@ func main() {
 	r.Get("/posts/{id}", getPostsID)
 	r.Post("/", postIndex)
 	r.Get("/image/{id}.{ext}", getImage)
+	// public/image/ が実在するようになったので、これが無いと下の FileServer が
+	// 1万件のディレクトリ一覧を返してしまう
+	r.Get("/image/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	})
 	r.Post("/comment", postComment)
 	r.Get("/admin/banned", getAdminBanned)
 	r.Post("/admin/banned", postAdminBanned)
 	r.Get(`/@{accountName:[0-9a-zA-Z_]+}`, getAccountName)
-	r.Mount("/", http.FileServer(http.Dir("../public")))
+	r.Mount("/", http.FileServer(http.Dir(publicDir)))
 
 	log.Fatal(http.ListenAndServe(":8080", r))
 }
