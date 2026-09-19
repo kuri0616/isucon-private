@@ -880,6 +880,9 @@ func main() {
 	cfg.DBName = dbname
 	cfg.Params = map[string]string{
 		"charset": "utf8mb4",
+		// プレースホルダをクライアント側で展開し、
+		// Prepare/Execute/Close の3往復を COM_QUERY 1往復に削減する
+		"interpolateParams": "true",
 	}
 	cfg.ParseTime = true
 	cfg.Loc = time.Local
